@@ -1,6 +1,5 @@
 package com.rental_hub.services;
 
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import com.rental_hub.repositories.EquipmentRepository;
