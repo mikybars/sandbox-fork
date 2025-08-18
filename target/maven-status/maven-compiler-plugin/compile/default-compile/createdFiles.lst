@@ -1,11 +1,11 @@
 com/rental_hub/Role.class
-com/rental_hub/controllers/TagsController.class
 com/rental_hub/entities/User.class
 com/rental_hub/controllers/EquipmentController.class
+com/rental_hub/entities/Tag.class
+com/rental_hub/repositories/TagRepository.class
+com/rental_hub/controllers/TagsController.class
 com/rental_hub/Application.class
 com/rental_hub/services/EquipmentService.class
 com/rental_hub/services/TagService.class
-com/rental_hub/entities/Tag.class
-com/rental_hub/repositories/TagRepository.class
 com/rental_hub/entities/Equipment.class
 com/rental_hub/repositories/EquipmentRepository.class
