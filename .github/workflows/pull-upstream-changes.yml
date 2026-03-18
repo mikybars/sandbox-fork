@@ -1,0 +1,182 @@
+# ============================================================================
+# Pull upstream changes Workflow
+# ============================================================================
+# This workflow pulls changes from an upstream (source) repository into a
+# local sync branch and opens a pull request to merge them into the target branch.
+#
+# SETUP INSTRUCTIONS:
+#   1. In your repo Settings > Actions > General > Workflow permissions:
+#      - Select "Read and write permissions"
+#      - Check "Allow GitHub Actions to create and approve pull requests"
+#      - Click Save
+#
+#   2. If the upstream repo is private, create a secret called
+#      UPSTREAM_REPO_SECRET with a classic PAT that has the 'repo' scope.
+#      If the org uses SSO, authorize the token for the org at:
+#      https://github.com/settings/tokens (click "Configure SSO" next to the token)
+#
+#   3. Update the variables below to match your setup.
+# ============================================================================
+
+name: 'Pull upstream changes'
+
+env:
+  # Prefix for the sync branch, prepended as-is (e.g. "sync/" → sync/owner-repo-branch)
+  SYNC_BRANCH_PREFIX: sync/
+  # Branch to merge upstream changes into (PR target)
+  TARGET_BRANCH: main
+  # Upstream repository to sync from (owner/repo)
+  UPSTREAM_REPO: mikybars/sandbox
+  # Branch to sync from in the upstream repository
+  UPSTREAM_BRANCH: main
+  # Label applied to sync PRs (name, description, color)
+  SYNC_PR_LABEL: upstream/sync
+  SYNC_PR_LABEL_DESCRIPTION: Automated PR to sync changes from upstream
+  SYNC_PR_LABEL_COLOR: 1D76DB
+
+on:
+  # schedule:
+  #   - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    name: Check for existing sync PR
+    outputs:
+      skip: ${{ steps.check_pr.outputs.skip }}
+    steps:
+      - name: Look for open sync PRs
+        id: check_pr
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --label "${{ env.SYNC_PR_LABEL }}" \
+            --state open \
+            --json number,url \
+            --jq '.[0] // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            PR_URL=$(echo "$EXISTING_PR" | jq -r '.url')
+            echo "There is another sync PR already open: $PR_URL — skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ### ⏭️ Sync skipped
+          There is another sync PR already open:
+          - $PR_URL
+
+          Merge that ☝🏼 first before continuing!
+          EOF
+          else
+            echo "No open sync PR found. Proceeding."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+  sync:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    name: Sync latest changes from upstream repo
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Set sync branch name
+        run: |
+          SUFFIX="${{ env.UPSTREAM_REPO }}/${{ env.UPSTREAM_BRANCH }}"
+          echo "SYNC_BRANCH=${{ env.SYNC_BRANCH_PREFIX }}${SUFFIX//\//-}" >> $GITHUB_ENV
+
+      - name: Checkout repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Verify upstream access
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          if [ -z "$UPSTREAM_TOKEN" ]; then
+            echo "ERROR: UPSTREAM_REPO_SECRET is empty or not set"
+            exit 1
+          fi
+          echo "Token length: ${#UPSTREAM_TOKEN} characters"
+          # Test API access
+          HTTP_CODE=$(curl --silent --output /dev/null --write-out "%{http_code}" \
+            --header "Authorization: token ${UPSTREAM_TOKEN}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}")
+          echo "API response code: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Cannot access upstream repo. Check token permissions and SSO authorization."
+            exit 1
+          fi
+          echo "Upstream repo access verified."
+
+      - name: Pull upstream changes
+        id: sync
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Fetch upstream branch directly by URL to avoid auth conflicts with origin
+          git fetch "https://${UPSTREAM_TOKEN}@github.com/${{ env.UPSTREAM_REPO }}.git" \
+            "${{ env.UPSTREAM_BRANCH }}"
+
+          # Check if there are new commits in upstream not yet in target
+          NEW_COMMITS=$(git log HEAD..FETCH_HEAD --oneline)
+
+          if [ -z "$NEW_COMMITS" ]; then
+            echo "No new commits to sync."
+            echo "has_new_commits=false" >> $GITHUB_OUTPUT
+            cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ### ✅ Already up to date
+          No new commits found in upstream.
+          EOF
+          else
+            echo "New commits found:"
+            echo "$NEW_COMMITS"
+
+            # Create the sync branch pointing directly at upstream HEAD
+            git switch --force-create "${{ env.SYNC_BRANCH }}" FETCH_HEAD
+
+            # Push the sync branch (create or update)
+            git push --force origin "${{ env.SYNC_BRANCH }}"
+            echo "has_new_commits=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.sync.outputs.has_new_commits == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          # Ensure the label exists in the repo
+          gh label create "${{ env.SYNC_PR_LABEL }}" \
+            --repo "${{ github.repository }}" \
+            --description "${{ env.SYNC_PR_LABEL_DESCRIPTION }}" \
+            --color "${{ env.SYNC_PR_LABEL_COLOR }}" \
+            2>/dev/null || true
+
+          PR_BODY=$(cat <<BODY
+          This is an automated PR to merge upstream changes from [${{ env.UPSTREAM_REPO }}:${{ env.UPSTREAM_BRANCH }}](https://github.com/${{ env.UPSTREAM_REPO }}/tree/${{ env.UPSTREAM_BRANCH }})
+
+          > [!WARNING]
+          > For troubleshooting, it is important to use **merge commit** when merging this PR
+          BODY
+          )
+
+          PR_URL=$(gh pr create \
+            --repo "${{ github.repository }}" \
+            --title "chore(sync): pull upstream changes" \
+            --body "$PR_BODY" \
+            --head "${{ env.SYNC_BRANCH }}" \
+            --base "${{ env.TARGET_BRANCH }}" \
+            --label "${{ env.SYNC_PR_LABEL }}")
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ### 🔄 Sync PR created
+          $PR_URL
+          EOF
