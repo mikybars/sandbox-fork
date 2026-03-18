@@ -1,0 +1,134 @@
+# ============================================================================
+# Upstream Sync Workflow
+# ============================================================================
+# This workflow syncs changes from an upstream (source) repository into a
+# local sync branch and opens a pull request to merge them into the target branch.
+#
+# SETUP INSTRUCTIONS:
+#   1. In your repo Settings > Actions > General > Workflow permissions:
+#      - Select "Read and write permissions"
+#      - Check "Allow GitHub Actions to create and approve pull requests"
+#      - Click Save
+#
+#   2. If the upstream repo is private, create a secret called
+#      UPSTREAM_REPO_SECRET with a classic PAT that has the 'repo' scope.
+#      If the org uses SSO, authorize the token for the org at:
+#      https://github.com/settings/tokens (click "Configure SSO" next to the token)
+#
+#   3. Update the variables below to match your setup.
+# ============================================================================
+
+name: 'Upstream Sync'
+
+env:
+  # -- CONFIGURABLE VARIABLES --
+  # Branch used to receive upstream changes
+  SYNC_BRANCH: sync
+  # Branch to merge upstream changes into (PR target)
+  TARGET_BRANCH: main
+  # Upstream repository to sync from (owner/repo)
+  UPSTREAM_REPO: mikybars/sandbox
+  # Branch to sync from in the upstream repository
+  UPSTREAM_BRANCH: main
+
+on:
+  # schedule:
+  #   - cron: "*/5 * * * *"
+
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    name: Sync latest commits from upstream repo
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v3
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Verify upstream access
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          if [ -z "$UPSTREAM_TOKEN" ]; then
+            echo "ERROR: UPSTREAM_REPO_SECRET is empty or not set"
+            exit 1
+          fi
+          echo "Token length: ${#UPSTREAM_TOKEN} characters"
+          # Test API access
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: token ${UPSTREAM_TOKEN}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}")
+          echo "API response code: $HTTP_CODE"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Cannot access upstream repo. Check token permissions and SSO authorization."
+            exit 1
+          fi
+          echo "Upstream repo access verified."
+
+      - name: Sync upstream changes
+        id: sync
+        env:
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          # Configure git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Remove the extraheader set by actions/checkout so it doesn't interfere
+          git config --local --unset-all http.https://github.com/.extraheader || true
+
+          # Add upstream remote with token in URL
+          git remote add upstream "https://${UPSTREAM_TOKEN}@github.com/${{ env.UPSTREAM_REPO }}.git"
+
+          # Fetch upstream branch
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+          # Re-configure auth for pushing to origin
+          git config --local http.https://github.com/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${{ secrets.GITHUB_TOKEN }} | base64)"
+
+          # Check if there are new commits in upstream not yet in target
+          NEW_COMMITS=$(git log HEAD..upstream/${{ env.UPSTREAM_BRANCH }} --oneline)
+
+          if [ -z "$NEW_COMMITS" ]; then
+            echo "No new commits to sync."
+            echo "has_new_commits=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits found:"
+            echo "$NEW_COMMITS"
+
+            # Create the sync branch pointing directly at upstream HEAD
+            git checkout -B ${{ env.SYNC_BRANCH }} upstream/${{ env.UPSTREAM_BRANCH }}
+
+            # Push the sync branch (create or update)
+            git push --force origin ${{ env.SYNC_BRANCH }}
+            echo "has_new_commits=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.sync.outputs.has_new_commits == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_REPO_SECRET }}
+        run: |
+          # TODO: re-enable existing PR check
+          # EXISTING_PR=$(gh pr list --head "${{ env.SYNC_BRANCH }}" --base "${{ env.TARGET_BRANCH }}" --state open --json number --jq '.[0].number // empty')
+          # if [ -z "$EXISTING_PR" ]; then
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --title "chore: sync upstream changes" \
+            --body "Automated PR to merge upstream changes from ${{ env.UPSTREAM_REPO }} into ${{ env.TARGET_BRANCH }}." \
+            --head "${{ env.SYNC_BRANCH }}" \
+            --base "${{ env.TARGET_BRANCH }}"
+          # else
+          #   echo "PR #$EXISTING_PR already exists, skipping creation."
+          # fi
+
+      - name: No new commits
+        if: steps.sync.outputs.has_new_commits == 'false'
+        run: echo "There were no new commits."
